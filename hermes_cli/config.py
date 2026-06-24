@@ -1439,6 +1439,22 @@ DEFAULT_CONFIG = {
             "timeout": 30,
             "extra_body": {},
         },
+        # Pre-turn prompt analysis — classifies each incoming user message
+        # before the agent loop starts to choose the best processing strategy
+        # (tool-use, history compression, context budget).  Disabled by default
+        # because it adds one auxiliary LLM call per turn; enable only when you
+        # want the router's strategy hints to apply.  A fast/cheap model is
+        # strongly recommended (e.g. gemini-flash, haiku) — the call is latency-
+        # sensitive since it runs in the turn prologue before the main response.
+        "prompt_analysis": {
+            "enabled": False,      # set True to activate pre-turn prompt classification
+            "provider": "auto",
+            "model": "",           # fast/cheap model recommended (e.g. gemini-flash, haiku)
+            "base_url": "",
+            "api_key": "",
+            "timeout": 10,         # seconds — keep short; analysis runs in the turn prologue
+            "extra_body": {},
+        },
         "mcp": {
             "provider": "auto",
             "model": "",

@@ -25,11 +25,14 @@ from __future__ import annotations
 import logging
 import threading
 import uuid
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from agent.iteration_budget import IterationBudget
 from agent.model_metadata import estimate_request_tokens_rough
+
+if TYPE_CHECKING:
+    from agent.prompt_analyzer import PromptAnalysis
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +62,8 @@ class TurnContext:
     plugin_user_context: str = ""
     # External-memory prefetch result, reused across loop iterations.
     ext_prefetch_cache: str = ""
+    # Pre-turn prompt classification result (None when analysis is disabled).
+    prompt_analysis: Optional["PromptAnalysis"] = field(default=None)
 
 
 def build_turn_context(
@@ -225,6 +230,46 @@ def build_turn_context(
 
     # Preserve the original user message (no nudge injection).
     original_user_message = persist_user_message if persist_user_message is not None else user_message
+
+    # ── Pre-turn prompt analysis (opt-in via auxiliary.prompt_analysis.enabled) ──
+    # Classifies the incoming prompt with a cheap, fast auxiliary LLM call so the
+    # loop can choose the best processing strategy (tool-use, history compression,
+    # context budget).  Always returns NULL_ANALYSIS when disabled or on any error
+    # so the main path is completely unaffected.
+    prompt_analysis = None
+    try:
+        from agent.prompt_analyzer import analyze_prompt
+        _pa_query = original_user_message if isinstance(original_user_message, str) else ""
+        _pa_history = list(messages) if messages else None
+        _pa_runtime: dict = {}
+        if getattr(agent, "provider", ""):
+            _pa_runtime["provider"] = agent.provider
+        if getattr(agent, "model", ""):
+            _pa_runtime["model"] = agent.model
+        if getattr(agent, "base_url", ""):
+            _pa_runtime["base_url"] = agent.base_url
+        if getattr(agent, "api_key", ""):
+            _pa_runtime["api_key"] = agent.api_key
+        if getattr(agent, "api_mode", ""):
+            _pa_runtime["api_mode"] = agent.api_mode
+        _analysis = analyze_prompt(
+            _pa_query,
+            _pa_history,
+            model=getattr(agent, "model", None),
+            main_runtime=_pa_runtime or None,
+        )
+        from agent.prompt_analyzer import NULL_ANALYSIS
+        if _analysis is not NULL_ANALYSIS:
+            prompt_analysis = _analysis
+            logger.debug(
+                "prompt_analysis: task_type=%s needs_tools=%s hints=%s budget=%s",
+                _analysis.task_type,
+                _analysis.needs_tools,
+                _analysis.strategy_hints,
+                _analysis.context_budget_hint,
+            )
+    except Exception:
+        pass  # analysis is best-effort; never interrupt the turn prologue
 
     # Track memory nudge trigger (turn-based, checked here).
     should_review_memory = False
@@ -405,4 +450,5 @@ def build_turn_context(
         should_review_memory=should_review_memory,
         plugin_user_context=plugin_user_context,
         ext_prefetch_cache=ext_prefetch_cache,
+        prompt_analysis=prompt_analysis,
     )

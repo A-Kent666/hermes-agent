@@ -559,6 +559,52 @@ def run_conversation(
     _should_review_memory = _ctx.should_review_memory
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
+    _prompt_analysis = _ctx.prompt_analysis  # may be None when analysis is disabled
+
+    # Apply strategy hints surfaced by the pre-turn prompt analysis.
+    # Each hint is a low-cost nudge; unknown hints are silently ignored so
+    # future additions to the hint vocabulary don't break older loop code.
+    if _prompt_analysis is not None:
+        _pa_hints = frozenset(_prompt_analysis.strategy_hints or [])
+        # "heavy_compute" — grant extra iterations for tasks expected to run many tools.
+        if "heavy_compute" in _pa_hints:
+            try:
+                _extra = max(0, agent.max_iterations // 3)
+                agent.iteration_budget = IterationBudget(agent.max_iterations + _extra)
+                logger.debug(
+                    "prompt_analysis: heavy_compute hint — raised iteration budget to %s",
+                    agent.max_iterations + _extra,
+                )
+            except Exception:
+                pass
+        # "no_tools" — if the agent is not forced to use tools, signal that the
+        # first call may not need them.  We store this as an attribute the Copilot
+        # ACP path and future optimizations can read without touching core kwargs.
+        if "no_tools" in _pa_hints:
+            agent._prompt_analysis_no_tools = True
+        else:
+            agent._prompt_analysis_no_tools = False
+        # "compact_history" — tell the Copilot ACP formatter (and any future
+        # history-slimming paths) that the caller only needs a recent-turns view.
+        agent._prompt_analysis_compact_history = "compact_history" in _pa_hints
+    else:
+        agent._prompt_analysis_no_tools = False
+        agent._prompt_analysis_compact_history = False
+
+    # Propagate strategy flags to the Copilot ACP client when it is the active
+    # transport.  The client's ``strategy`` dict is read by
+    # ``_create_chat_completion`` → ``_format_messages_as_prompt`` on every
+    # Copilot ACP call, so the turn-level flags take effect immediately.
+    try:
+        from agent.copilot_acp_client import CopilotACPClient
+        _active_client = getattr(agent, "_client", None)
+        if isinstance(_active_client, CopilotACPClient):
+            _active_client.strategy = {
+                "compact_history": agent._prompt_analysis_compact_history,
+                "no_tools": agent._prompt_analysis_no_tools,
+            }
+    except Exception:
+        pass
 
     # Main conversation loop counters (pure locals consumed by the loop below).
     api_call_count = 0

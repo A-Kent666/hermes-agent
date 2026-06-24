@@ -130,7 +130,29 @@ def _format_messages_as_prompt(
     model: str | None = None,
     tools: list[dict[str, Any]] | None = None,
     tool_choice: Any = None,
+    *,
+    compact_history: bool = False,
+    no_tools: bool = False,
 ) -> str:
+    """Serialize the conversation to a single ACP prompt string.
+
+    Args:
+        messages: The full working message list for this turn.
+        model: Optional model-hint string forwarded as context.
+        tools: Tool schema list. Omitted from the prompt when ``no_tools``
+            is ``True`` or when the list is empty/None.
+        tool_choice: Tool-choice hint. Omitted when ``None`` or ``"auto"``.
+        compact_history: When ``True`` (set by the ``"compact_history"``
+            strategy hint from pre-turn prompt analysis), only the system
+            message and the most recent four user/assistant turns are
+            included in the transcript.  Tool result messages that are not
+            part of those recent turns are dropped — they are the biggest
+            source of unnecessary tokens on conversational follow-up turns.
+        no_tools: When ``True`` (set by the ``"no_tools"`` strategy hint),
+            the tool-schema block and tool-choice hint are omitted entirely,
+            saving the tokens that would otherwise be spent describing tools
+            the model is unlikely to call this turn.
+    """
     sections: list[str] = [
         "You are being used as the active ACP agent backend for Hermes.",
         "Use ACP capabilities to complete tasks.",
@@ -140,7 +162,7 @@ def _format_messages_as_prompt(
     if model:
         sections.append(f"Hermes requested model hint: {model}")
 
-    if isinstance(tools, list) and tools:
+    if not no_tools and isinstance(tools, list) and tools:
         tool_specs: list[dict[str, Any]] = []
         for t in tools:
             if not isinstance(t, dict):
@@ -151,26 +173,70 @@ def _format_messages_as_prompt(
             name = fn.get("name")
             if not isinstance(name, str) or not name.strip():
                 continue
-            tool_specs.append(
-                {
-                    "name": name.strip(),
-                    "description": fn.get("description", ""),
-                    "parameters": fn.get("parameters", {}),
-                }
-            )
+            desc = (fn.get("description") or "").strip()
+            params = fn.get("parameters") or {}
+            # Minify: omit additionalProperties (always false) and empty descriptions.
+            clean_params: dict[str, Any] = {}
+            if isinstance(params, dict):
+                for pk, pv in params.items():
+                    if pk == "additionalProperties":
+                        continue
+                    if pk == "properties" and isinstance(pv, dict):
+                        clean_props: dict[str, Any] = {}
+                        for prop_name, prop_val in pv.items():
+                            if isinstance(prop_val, dict):
+                                clean_prop = {
+                                    k2: v2 for k2, v2 in prop_val.items()
+                                    if not (k2 == "description" and not str(v2 or "").strip())
+                                    and k2 != "additionalProperties"
+                                }
+                                clean_props[prop_name] = clean_prop
+                            else:
+                                clean_props[prop_name] = prop_val
+                        clean_params[pk] = clean_props
+                    else:
+                        clean_params[pk] = pv
+            tool_spec: dict[str, Any] = {"name": name.strip()}
+            if desc:
+                tool_spec["description"] = desc
+            if clean_params:
+                tool_spec["parameters"] = clean_params
+            tool_specs.append(tool_spec)
         if tool_specs:
             sections.append(
                 "Available tools (OpenAI function schema). "
                 "When using a tool, emit ONLY <tool_call>{...}</tool_call> with one JSON object "
                 "containing id/type/function{name,arguments}. arguments must be a JSON string.\n"
-                + json.dumps(tool_specs, ensure_ascii=False)
+                + json.dumps(tool_specs, separators=(",", ":"), ensure_ascii=False)
             )
 
-    if tool_choice is not None:
+    # Omit tool_choice when it's the default auto value — it is noise in the prompt.
+    if not no_tools and tool_choice is not None and tool_choice != "auto":
         sections.append(f"Tool choice hint: {json.dumps(tool_choice, ensure_ascii=False)}")
 
+    # Build the transcript, optionally trimming to a compact recent-turns view.
+    # Compact mode: keep the system message plus the last four user/assistant
+    # turns only; drop all tool result messages outside that window.
+    all_messages: list[dict[str, Any]] = [m for m in messages if isinstance(m, dict)]
+    if compact_history and all_messages:
+        system_msgs = [m for m in all_messages if m.get("role") == "system"]
+        non_system = [m for m in all_messages if m.get("role") != "system"]
+        # Collect user/assistant turns (groups of consecutive non-tool messages).
+        ua_indices: list[int] = [
+            i for i, m in enumerate(non_system) if m.get("role") in ("user", "assistant")
+        ]
+        # Keep the last 4 user/assistant messages and any tool messages sandwiched
+        # between the kept assistant turns (so the agent still sees tool results
+        # for the most recent tool calls).
+        if ua_indices:
+            keep_from = ua_indices[max(0, len(ua_indices) - 4)]
+            recent = non_system[keep_from:]
+        else:
+            recent = non_system
+        all_messages = system_msgs + recent
+
     transcript: list[str] = []
-    for message in messages:
+    for message in all_messages:
         if not isinstance(message, dict):
             continue
         role = str(message.get("role") or "unknown").strip().lower()
@@ -350,6 +416,10 @@ class CopilotACPClient:
         self.is_closed = False
         self._active_process: subprocess.Popen[str] | None = None
         self._active_process_lock = threading.Lock()
+        # Strategy flags written by the agent loop after pre-turn prompt
+        # analysis.  Defaults are safe/conservative (no optimisation).
+        # Keys: "compact_history" (bool), "no_tools" (bool).
+        self.strategy: dict[str, Any] = {}
 
     def close(self) -> None:
         proc: subprocess.Popen[str] | None
@@ -378,11 +448,14 @@ class CopilotACPClient:
         tool_choice: Any = None,
         **_: Any,
     ) -> Any:
+        _strategy = self.strategy if isinstance(self.strategy, dict) else {}
         prompt_text = _format_messages_as_prompt(
             messages or [],
             model=model,
             tools=tools,
             tool_choice=tool_choice,
+            compact_history=bool(_strategy.get("compact_history", False)),
+            no_tools=bool(_strategy.get("no_tools", False)),
         )
         # Normalise timeout: run_agent.py may pass an httpx.Timeout object
         # (used natively by the OpenAI SDK) rather than a plain float.
