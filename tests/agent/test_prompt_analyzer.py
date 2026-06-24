@@ -230,7 +230,7 @@ class TestAnalyzePrompt:
 
         with (
             patch("hermes_cli.config.load_config", return_value=cfg),
-            patch("agent.auxiliary_client.call_llm", return_value=mock_resp),
+            patch("agent.prompt_analyzer.call_llm", return_value=mock_resp),
         ):
             result = analyze_prompt("write a fibonacci function")
 
@@ -242,7 +242,7 @@ class TestAnalyzePrompt:
         cfg = {"auxiliary": {"prompt_analysis": {"enabled": True}}}
         with (
             patch("hermes_cli.config.load_config", return_value=cfg),
-            patch("agent.auxiliary_client.call_llm", side_effect=RuntimeError("network error")),
+            patch("agent.prompt_analyzer.call_llm", side_effect=RuntimeError("network error")),
         ):
             result = analyze_prompt("what time is it?")
         assert result is NULL_ANALYSIS
@@ -252,7 +252,7 @@ class TestAnalyzePrompt:
         mock_resp = _make_llm_response(_valid_json())
         with (
             patch("hermes_cli.config.load_config", return_value=cfg),
-            patch("agent.auxiliary_client.call_llm", return_value=mock_resp) as mock_llm,
+            patch("agent.prompt_analyzer.call_llm", return_value=mock_resp) as mock_llm,
         ):
             analyze_prompt(
                 "hello",
@@ -269,7 +269,7 @@ class TestAnalyzePrompt:
         mock_resp = _make_llm_response(_valid_json())
         with (
             patch("hermes_cli.config.load_config", return_value=cfg),
-            patch("agent.auxiliary_client.call_llm", return_value=mock_resp),
+            patch("agent.prompt_analyzer.call_llm", return_value=mock_resp),
         ):
             result = analyze_prompt("hello", None)
         assert result is not NULL_ANALYSIS

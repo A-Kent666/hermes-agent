@@ -54,6 +54,19 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
+# Lazy import so the module loads fast and the symbol is patchable in tests.
+# ``from agent.auxiliary_client import call_llm`` at module top would trigger
+# a heavyweight SDK import chain on every agent startup.  The pattern here
+# mirrors ``agent.auxiliary_client``'s own lazy OpenAI SDK loader.
+def _load_call_llm():
+    from agent.auxiliary_client import call_llm as _fn  # noqa: PLC0415
+    return _fn
+
+
+def call_llm(*args, **kwargs):  # type: ignore[misc]  # noqa: F811
+    """Thin forwarder — replaced by ``patch('agent.prompt_analyzer.call_llm')`` in tests."""
+    return _load_call_llm()(*args, **kwargs)
+
 # ---------------------------------------------------------------------------
 # Public data types
 # ---------------------------------------------------------------------------
@@ -286,13 +299,11 @@ def analyze_prompt(
 
     messages = _build_analysis_messages(user_message, conversation_history)
 
+    _runtime: Dict[str, Any] = dict(main_runtime or {})
+    if model and "model" not in _runtime:
+        _runtime["model"] = model
+
     try:
-        from agent.auxiliary_client import call_llm
-
-        _runtime: Dict[str, Any] = dict(main_runtime or {})
-        if model and "model" not in _runtime:
-            _runtime["model"] = model
-
         response = call_llm(
             task="prompt_analysis",
             messages=messages,
